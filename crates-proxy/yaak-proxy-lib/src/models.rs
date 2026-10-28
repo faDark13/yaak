@@ -53,9 +53,13 @@ pub struct Flow {
     /// Milliseconds from `started_at` to the end of the response.
     pub elapsed_ms: Option<i32>,
     pub error: Option<String>,
+    /// The id of the Yaak request this flow was last saved as.
+    pub saved_request_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
 pub enum FlowBody {
     Request,
     Response,
@@ -143,6 +147,7 @@ impl UpsertModelInfo for Flow {
             (ElapsedHeadersMs, self.elapsed_headers_ms.into()),
             (ElapsedMs, self.elapsed_ms.into()),
             (Error, self.error.into()),
+            (SavedRequestId, self.saved_request_id.into()),
         ])
     }
 
@@ -166,6 +171,7 @@ impl UpsertModelInfo for Flow {
             FlowIden::ElapsedHeadersMs,
             FlowIden::ElapsedMs,
             FlowIden::Error,
+            FlowIden::SavedRequestId,
         ]
     }
 
@@ -196,6 +202,11 @@ impl UpsertModelInfo for Flow {
             elapsed_headers_ms: r.get("elapsed_headers_ms")?,
             elapsed_ms: r.get("elapsed_ms")?,
             error: r.get("error")?,
+            // Absent from a database read before its migrations have run.
+            saved_request_id: match r.get("saved_request_id") {
+                Err(rusqlite::Error::InvalidColumnName(_)) => None,
+                v => v?,
+            },
         })
     }
 }

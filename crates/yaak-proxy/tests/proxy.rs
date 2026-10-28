@@ -6,9 +6,10 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::header::{CONNECTION, UPGRADE};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, UPGRADE};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -76,19 +77,47 @@ fn test_pki() -> TestPki {
     TestPki { ca_pem: ca.pem(), ca_der: ca.der().clone(), server: Arc::new(server) }
 }
 
-async fn route(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+type TestBody = BoxBody<Bytes, Infallible>;
+
+fn full(data: impl Into<Bytes>) -> TestBody {
+    Full::new(data.into()).boxed()
+}
+
+async fn route(req: Request<Incoming>) -> Result<Response<TestBody>, Infallible> {
     Ok(match req.uri().path() {
-        "/hello" => Response::new(Full::from("hello")),
-        "/echo" => Response::new(Full::new(req.into_body().collect().await.unwrap().to_bytes())),
-        "/big" => Response::new(Full::from(vec![b'x'; BIG_BODY])),
+        "/hello" => Response::new(full("hello")),
+        "/echo" => Response::new(full(req.into_body().collect().await.unwrap().to_bytes())),
+        "/authority" => Response::new(full(format!(
+            "authority={} host={}",
+            req.uri().authority().map_or("none".into(), |a| a.to_string()),
+            req.headers().get(HOST).map_or("none", |h| h.to_str().unwrap()),
+        ))),
+        "/big" => Response::new(full(vec![b'x'; BIG_BODY])),
+        "/late-end" => late_end(5),
+        // The stream ends with half the promised bytes, so the upstream resets it mid-body.
+        "/cut" => late_end(10),
         "/ws" => websocket_echo(req),
-        _ => {
-            Response::builder().status(StatusCode::NOT_FOUND).body(Full::from("not found")).unwrap()
-        }
+        _ => Response::builder().status(StatusCode::NOT_FOUND).body(full("not found")).unwrap(),
     })
 }
 
-fn websocket_echo(mut req: Request<Incoming>) -> Response<Full<Bytes>> {
+/// "hello" under a Content-Length of `content_length`, its end of stream sent a while after the
+/// last byte, as an HTTP/2 server does when its final DATA frame has no END_STREAM.
+fn late_end(content_length: usize) -> Response<TestBody> {
+    let frames = futures_util::stream::unfold(false, |sent| async move {
+        if sent {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            return None;
+        }
+        Some((Ok(Frame::data(Bytes::from("hello"))), true))
+    });
+    Response::builder()
+        .header(CONTENT_LENGTH, content_length)
+        .body(BodyExt::boxed(StreamBody::new(frames)))
+        .unwrap()
+}
+
+fn websocket_echo(mut req: Request<Incoming>) -> Response<TestBody> {
     let accept = derive_accept_key(req.headers()["sec-websocket-key"].as_bytes());
     let on_upgrade = hyper::upgrade::on(&mut req);
     tokio::spawn(async move {
@@ -105,7 +134,7 @@ fn websocket_echo(mut req: Request<Incoming>) -> Response<Full<Bytes>> {
         .header(UPGRADE, "websocket")
         .header(CONNECTION, "Upgrade")
         .header("sec-websocket-accept", accept)
-        .body(Full::default())
+        .body(full(Bytes::new()))
         .unwrap()
 }
 
@@ -176,6 +205,16 @@ impl Harness {
         self.client_trusting(self.ca.pem())
     }
 
+    /// Sends `req` to the proxy exactly as built, bare path and all, as a client that doesn't know
+    /// it is talking to a proxy would.
+    async fn send_as_written(&self, req: Request<TestBody>) -> Response<Incoming> {
+        let tcp = TcpStream::connect(("127.0.0.1", self.proxy.port)).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await.unwrap();
+        tokio::spawn(conn);
+        sender.send_request(req).await.unwrap()
+    }
+
     /// A raw connection tunneled through the proxy with CONNECT to `localhost:port`.
     async fn connect_tunnel(&self, port: u16) -> TcpStream {
         let mut tcp = TcpStream::connect(("127.0.0.1", self.proxy.port)).await.unwrap();
@@ -201,6 +240,19 @@ impl Harness {
             .with_root_certificates(roots)
             .with_no_client_auth();
         Arc::new(config)
+    }
+
+    /// Waits until the engine reports `state` (failures counted, passed through) for `addr`.
+    async fn wait_for_handshake_state(&self, addr: &str, state: (u32, bool)) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.proxy.handshake_state(addr) != state {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{addr} stayed at {:?}, expected {state:?}",
+                self.proxy.handshake_state(addr)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Events of the next flow, through its terminal event plus any stragglers.
@@ -344,6 +396,62 @@ async fn https_post_with_body() {
     assert_eq!(body(&events, false), (b"name=yaak".to_vec(), 9));
 }
 
+/// Chrome's request headers for `optimizationguide-pa.googleapis.com`, plus the other headers
+/// HTTP/2 forbids. Google resets an HTTP/2 stream that has `Host` alongside `:authority`, and
+/// hyper's HTTP/2 server resets one with any of the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn https_h2_upstream_gets_authority_without_host() {
+    let h = Harness::start(1024);
+    let upstream = spawn_upstream(Some(h.pki.server.clone())).await;
+    let url = format!("https://localhost:{}/authority", upstream.port());
+
+    let resp = h
+        .client()
+        .post(&url)
+        .header("connection", "keep-alive, x-hop")
+        .header("x-hop", "1")
+        .header("keep-alive", "timeout=5")
+        .header("proxy-connection", "keep-alive")
+        .header("te", "gzip")
+        .header("content-type", "application/x-protobuf")
+        .header("sec-fetch-site", "none")
+        .header("sec-fetch-mode", "no-cors")
+        .header("sec-fetch-dest", "empty")
+        .header(
+            "user-agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like \
+             Gecko) Chrome/156.0.0.0 Safari/537.36",
+        )
+        .header("accept-encoding", "gzip, deflate, br, zstd")
+        .body(vec![0u8; 1034])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let expected = format!("authority=localhost:{} host=none", upstream.port());
+    assert_eq!(resp.text().await.unwrap(), expected);
+
+    let events = h.flow_events();
+    let version = find!(events, ProxyEvent::ResponseStart { http_version, .. } => http_version);
+    assert_eq!(version, "HTTP/2");
+    let captured_host = events.iter().any(|e| {
+        matches!(e, ProxyEvent::RequestHeader { name, value, .. }
+            if name == "host" && *value == format!("localhost:{}", upstream.port()))
+    });
+    assert!(captured_host, "the captured request keeps Host");
+}
+
+/// A `Host` other than the CONNECT target still names the virtual host upstream.
+#[tokio::test(flavor = "multi_thread")]
+async fn https_h2_upstream_gets_the_clients_host_as_authority() {
+    let h = Harness::start(1024);
+    let upstream = spawn_upstream(Some(h.pki.server.clone())).await;
+    let url = format!("https://localhost:{}/authority", upstream.port());
+
+    let resp = h.client().get(&url).header("host", "yaak.test:8443").send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "authority=yaak.test:8443 host=none");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn https_not_found() {
     let h = Harness::start(1024);
@@ -359,6 +467,41 @@ async fn https_not_found() {
     let error = find!(events, ProxyEvent::ResponseBodyComplete { error, .. } => error.clone());
     assert_eq!(error, None);
     assert_eq!(body(&events, false), (b"not found".to_vec(), 9));
+}
+
+/// The client is sent every byte the Content-Length promised, and hyper drops the body there,
+/// before an HTTP/2 upstream's end of stream arrives. That is a complete response, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn https_body_complete_before_end_of_stream() {
+    let h = Harness::start(1024);
+    let upstream = spawn_upstream(Some(h.pki.server.clone())).await;
+    let url = format!("https://localhost:{}/late-end", upstream.port());
+
+    let resp = h.client().get(&url).send().await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "hello");
+
+    let events = h.flow_events();
+    let version =
+        find!(events, ProxyEvent::ResponseStart { http_version, .. } => http_version.clone());
+    assert_eq!(version, "HTTP/2");
+    let (size, error) = find!(events,
+        ProxyEvent::ResponseBodyComplete { size, error, .. } => (*size, error.clone()));
+    assert_eq!((size, error), (5, None));
+    assert_eq!(body(&events, false), (b"hello".to_vec(), 5));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_body_cut_short_is_an_error() {
+    let h = Harness::start(1024);
+    let upstream = spawn_upstream(Some(h.pki.server.clone())).await;
+    let url = format!("https://localhost:{}/cut", upstream.port());
+
+    let resp = h.client().get(&url).send().await.unwrap();
+    assert!(resp.bytes().await.is_err());
+
+    let events = h.flow_events();
+    let error = find!(events, ProxyEvent::ResponseBodyComplete { error, .. } => error.clone());
+    assert!(error.is_some(), "{events:#?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -464,6 +607,36 @@ async fn certificate_alert_passes_through_on_the_next_connection() {
         .expect("one certificate alert should be enough to pass the host through");
 }
 
+/// SChannel (native-tls on Windows) checks the certificate only after sending its Finished, so
+/// the proxy sees a completed handshake and then a hang-up instead of an alert.
+#[tokio::test(flavor = "multi_thread")]
+async fn hang_up_after_the_handshake_passes_through() {
+    let h = Harness::start(1024);
+    let upstream = spawn_upstream(Some(h.pki.server.clone())).await;
+    let port = upstream.port();
+    let name = ServerName::try_from("localhost").unwrap();
+
+    let addr = format!("localhost:{port}");
+    let hangs_up = TlsConnector::from(h.tls_client_config());
+    for state in [(1, false), (0, true)] {
+        let tls = hangs_up.connect(name.clone(), h.connect_tunnel(port).await).await.unwrap();
+        drop(tls);
+        h.wait_for_handshake_state(&addr, state).await;
+    }
+
+    let mut roots = RootCertStore::empty();
+    roots.add(h.pki.ca_der.clone()).unwrap();
+    let config = ClientConfig::builder_with_provider(ring())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
+        .connect(name, h.connect_tunnel(port).await)
+        .await
+        .expect("two hang-ups after the handshake should pass the host through");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn abandoned_handshake_does_not_disable_capture() {
     let h = Harness::start(1024);
@@ -545,4 +718,75 @@ async fn unreachable_upstream_is_an_error() {
     let error = find!(events, ProxyEvent::Error { error, .. } => error.clone());
     assert!(error.to_lowercase().contains("connect"), "{error}");
     assert!(!events.iter().any(|e| matches!(e, ProxyEvent::ResponseStart { .. })));
+}
+
+/// Telegram's HTTP transport request, `POST /api` with only `Host` to say where it goes, from the
+/// failing flows. `host` replaces Telegram's `149.154.175.58:80`.
+fn telegram_request(host: Option<&str>, path: &str, payload: &[u8]) -> Request<TestBody> {
+    let mut builder = Request::post(path);
+    if let Some(host) = host {
+        builder = builder.header("host", host);
+    }
+    builder
+        .header("content-length", payload.len())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("connection", "Keep-Alive")
+        .header("accept-encoding", "gzip, deflate")
+        .header("accept-language", "en-US,*")
+        .header("user-agent", "Mozilla/5.0")
+        .body(full(payload.to_vec()))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_http_bare_path_is_sent_to_host() {
+    let h = Harness::start(1024);
+    let upstream = spawn_upstream(None).await;
+    let payload = [0xefu8; 44];
+
+    let resp = h.send_as_written(telegram_request(Some(&upstream.to_string()), "/echo", &payload));
+    let resp = resp.await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), &payload[..]);
+
+    let events = h.flow_events();
+    let url = find!(events, ProxyEvent::RequestStart { url, .. } => url.clone());
+    assert_eq!(url, format!("http://{upstream}/echo"));
+    let (status, remote_addr) = find!(events,
+        ProxyEvent::ResponseStart { status, remote_addr, .. } => (*status, *remote_addr));
+    assert_eq!((status, remote_addr), (200, Some(upstream)));
+    assert_eq!(body(&events, true), (payload.to_vec(), 44));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_http_bare_path_without_host_is_a_bad_request() {
+    let h = Harness::start(1024);
+
+    let resp = h.send_as_written(telegram_request(None, "/api", &[0xefu8; 44])).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.headers()[CONTENT_TYPE], "text/plain; charset=utf-8");
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "no host in request");
+
+    let events = h.flow_events();
+    assert_eq!(find!(events, ProxyEvent::RequestStart { url, .. } => url.clone()), "/api");
+    let error = find!(events, ProxyEvent::Error { error, .. } => error.clone());
+    assert_eq!(error, "no host in request");
+    assert!(!events.iter().any(|e| matches!(e, ProxyEvent::ResponseStart { .. })));
+}
+
+/// A request whose connection upstream is routed back into the proxy, as happened to Telegram's
+/// while the system proxy was on, arrives again with a bare path. Sending that on would loop
+/// forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_http_request_looped_back_to_the_proxy_stops() {
+    let h = Harness::start(1024);
+    let url = format!("http://127.0.0.1:{}/api", h.proxy.port);
+
+    let resp = h.client().post(&url).body(vec![0xefu8; 44]).send().await.unwrap();
+    assert_eq!(resp.status(), 508);
+    assert_eq!(resp.text().await.unwrap(), "request looped back to Yaak Proxy");
+
+    let events = h.flow_events();
+    let error = find!(events, ProxyEvent::Error { error, .. } => error.clone());
+    assert_eq!(error, "request looped back to Yaak Proxy");
 }

@@ -4,7 +4,9 @@ mod connection;
 mod request;
 mod tunnel;
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -12,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use bytes::Bytes;
+use http::HeaderValue;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -120,7 +123,9 @@ pub enum ProxyEvent {
         elapsed_ms: u64,
         error: Option<String>,
     },
-    /// No response: connecting to or requesting from upstream failed. The client got a 502.
+    /// No response: connecting to or requesting from upstream failed, and the client got a 502,
+    /// or the engine refused the request (no host to send it to, or it looped back to the engine)
+    /// with a 4xx or 5xx of its own.
     Error {
         id: u64,
         error: String,
@@ -133,6 +138,7 @@ pub struct ProxyHandle {
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     thread_handle: Option<std::thread::JoinHandle<()>>,
     event_rx: Option<std_mpsc::Receiver<ProxyEvent>>,
+    engine: Arc<Engine>,
     /// The bound port.
     pub port: u16,
 }
@@ -141,6 +147,14 @@ impl ProxyHandle {
     /// Take the event receiver. Can only be called once — returns `None` after the first call.
     pub fn take_event_rx(&mut self) -> Option<std_mpsc::Receiver<ProxyEvent>> {
         self.event_rx.take()
+    }
+
+    /// Handshake failures counted toward passing `addr` (`host:port`) through, and whether it
+    /// already is. For tests that must wait for the engine to record a failure.
+    #[doc(hidden)]
+    pub fn handshake_state(&self, addr: &str) -> (u32, bool) {
+        let failures = self.engine.handshake_failures.lock().unwrap().get(addr).copied();
+        (failures.unwrap_or_default(), self.engine.is_passthrough(addr))
     }
 }
 
@@ -165,6 +179,9 @@ pub(crate) struct Engine {
     upstream_tls_h1: Arc<ClientConfig>,
     passthrough: Mutex<HashSet<String>>,
     handshake_failures: Mutex<HashMap<String, u32>>,
+    /// `Via` value marking requests whose URL the engine rebuilt from `Host`, unique to this run,
+    /// so one that comes back to the engine is refused instead of forwarded again.
+    via: HeaderValue,
 }
 
 impl Engine {
@@ -180,8 +197,8 @@ impl Engine {
         self.passthrough.lock().unwrap().contains(addr)
     }
 
-    /// Returns whether `addr` is now passed through. macOS clients reject the CA with a bare
-    /// reset, indistinguishable from an abandoned handshake, so those need two in a row.
+    /// Returns whether `addr` is now passed through. macOS and Windows clients reject the CA with
+    /// a bare hang-up, indistinguishable from an abandoned connection, so those need two in a row.
     fn record_handshake_failure(&self, addr: &str, certificate_rejected: bool) -> bool {
         let mut failures = self.handshake_failures.lock().unwrap();
         let count = failures.entry(addr.to_string()).or_default();
@@ -213,6 +230,11 @@ fn upstream_tls_config(
     Ok(Arc::new(config))
 }
 
+fn via_marker() -> HeaderValue {
+    let run = RandomState::new().build_hasher().finish();
+    HeaderValue::try_from(format!("1.1 yaak-proxy-{run:016x}")).unwrap()
+}
+
 /// Starts the engine on its own thread and Tokio runtime, returning once the port is bound.
 pub fn start_proxy(config: ProxyConfig) -> Result<ProxyHandle, String> {
     let mut roots = rustls::RootCertStore::empty();
@@ -234,9 +256,11 @@ pub fn start_proxy(config: ProxyConfig) -> Result<ProxyHandle, String> {
         upstream_tls_h1: upstream_tls_config(&roots, &[b"http/1.1"])?,
         passthrough: Mutex::new(HashSet::new()),
         handshake_failures: Mutex::new(HashMap::new()),
+        via: via_marker(),
     });
 
     let port = config.port;
+    let handle_engine = engine.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = std_mpsc::channel();
 
@@ -286,6 +310,7 @@ pub fn start_proxy(config: ProxyConfig) -> Result<ProxyHandle, String> {
             shutdown_tx: Some(shutdown_tx),
             thread_handle: Some(thread_handle),
             event_rx: Some(event_rx),
+            engine: handle_engine,
             port,
         }),
         Ok(Err(e)) => Err(e),

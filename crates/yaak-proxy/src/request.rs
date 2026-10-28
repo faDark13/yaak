@@ -7,7 +7,8 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{HOST, UPGRADE};
+use hyper::header::{CONTENT_TYPE, HOST, UPGRADE, VIA};
+use hyper::http::uri::{Authority, PathAndQuery, Scheme};
 use hyper::upgrade::OnUpgrade;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::connect::HttpInfo;
@@ -113,6 +114,21 @@ impl Flow {
         Response::from_parts(parts, body.boxed())
     }
 
+    /// Answers the client with `status` and `error` without contacting any server.
+    fn reject(self, status: StatusCode, error: &str) -> Response<BoxBody> {
+        debug!("Flow {} rejected: {error}", self.id);
+        self.engine.emit(ProxyEvent::Error {
+            id: self.id,
+            error: error.to_string(),
+            elapsed_ms: self.start.elapsed().as_millis() as u64,
+        });
+        Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(text_body(error.to_string()))
+            .unwrap()
+    }
+
     fn fail(self, error: String) -> Response<BoxBody> {
         debug!("Flow {} failed: {error}", self.id);
         let body = format!("Yaak Proxy could not reach the server: {error}");
@@ -130,14 +146,24 @@ fn bad_gateway(body: String) -> Response<BoxBody> {
 }
 
 pub(crate) async fn handle_request(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     engine: Arc<Engine>,
 ) -> Result<Response<BoxBody>, Infallible> {
     if req.method() == Method::CONNECT {
         return Ok(handle_connect(req, engine));
     }
 
+    // Some clients send a bare path (`POST /api`) as they would to the server itself.
+    let from_host = req.uri().authority().is_none();
+    let rejected = if from_host { url_from_host(&mut req, &engine).err() } else { None };
     let flow = Flow::begin(engine.clone(), &req, req.uri().to_string());
+    if let Some((status, error)) = rejected {
+        return Ok(flow.reject(status, error));
+    }
+    if from_host {
+        req.headers_mut().append(VIA, engine.via.clone());
+    }
+
     let (parts, body) = req.into_parts();
     let outgoing = Request::from_parts(parts, flow.capture_request(body));
     Ok(match engine.http_client.request(outgoing).await {
@@ -147,6 +173,41 @@ pub(crate) async fn handle_request(
         }
         Err(e) => flow.fail(error_chain(&e)),
     })
+}
+
+/// Gives a bare-path request the `http://` URL its `Host` names. Fails when there is no usable
+/// `Host`, or when the request carries this engine's `Via` mark: then it is one the engine sent
+/// that was routed back to it, and forwarding it again would loop forever.
+fn url_from_host(
+    req: &mut Request<Incoming>,
+    engine: &Engine,
+) -> Result<(), (StatusCode, &'static str)> {
+    let Some(host) = req.headers().get(HOST) else {
+        return Err((StatusCode::BAD_REQUEST, "no host in request"));
+    };
+    let Some(authority) = host.to_str().ok().and_then(|h| h.parse::<Authority>().ok()) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid host in request"));
+    };
+    let mut parts = std::mem::take(req.uri_mut()).into_parts();
+    parts.scheme = Some(Scheme::HTTP);
+    parts.authority = Some(authority);
+    if parts.path_and_query.is_none() {
+        parts.path_and_query = Some(PathAndQuery::from_static("/"));
+    }
+    *req.uri_mut() =
+        Uri::from_parts(parts).map_err(|_| (StatusCode::BAD_REQUEST, "invalid host in request"))?;
+
+    let via = engine.via.to_str().unwrap_or_default();
+    let looped = req
+        .headers()
+        .get_all(VIA)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.split(',').any(|hop| hop.trim() == via));
+    if looped {
+        return Err((StatusCode::LOOP_DETECTED, "request looped back to Yaak Proxy"));
+    }
+    Ok(())
 }
 
 /// Where an intercepted CONNECT tunnel leads.
@@ -219,22 +280,55 @@ where
         .map(str::to_string)
         .unwrap_or_else(|| target.server_name.clone());
     let config = engine.ca.server_config(&server_name)?;
-    let tls = match start.into_stream(config).await {
+    let mut tls = match start.into_stream(config).await {
         Ok(tls) => tls,
         Err(e) => {
-            if engine.record_handshake_failure(&target.addr, is_certificate_rejection(&e)) {
-                info!("Client rejected the proxy for {}, passing it through: {e}", target.addr);
-            } else {
-                debug!("TLS handshake with client failed for {}: {e}", target.addr);
-            }
+            record_handshake_failure(&engine, &target.addr, is_certificate_rejection(&e), &e);
             return Ok(());
         }
     };
+
+    // SChannel (native-tls on Windows) checks the certificate only after sending its Finished,
+    // so it rejects the proxy by hanging up on a completed handshake. Only a request counts as
+    // success.
+    let mut buf = vec![0u8; 4096];
+    let n = match tls.read(&mut buf).await {
+        Ok(n) => n,
+        Err(e) if is_hang_up(&e) => {
+            record_handshake_failure(&engine, &target.addr, false, &e);
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if n == 0 {
+        return Ok(());
+    }
+    buf.truncate(n);
     engine.record_handshake_success(&target.addr);
 
+    let tls = Rewind::new(Bytes::from(buf), tls);
     let target = Arc::new(Target { server_name, ..target });
     serve_http1(tls, move |req| forward_https(req, target.clone(), engine.clone())).await?;
     Ok(())
+}
+
+fn record_handshake_failure(
+    engine: &Engine,
+    addr: &str,
+    certificate_rejected: bool,
+    e: &std::io::Error,
+) {
+    if engine.record_handshake_failure(addr, certificate_rejected) {
+        info!("Client rejected the proxy for {addr}, passing it through: {e}");
+    } else {
+        debug!("TLS handshake with client failed for {addr}: {e}");
+    }
+}
+
+/// The client closed the connection without a TLS `close_notify`, or reset it.
+fn is_hang_up(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionReset, UnexpectedEof};
+    matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted)
 }
 
 fn is_certificate_rejection(e: &std::io::Error) -> bool {
@@ -318,14 +412,23 @@ async fn forward_https(
 
     let (mut parts, body) = req.into_parts();
     let uri = match &upstream {
-        Upstream::H2(_) => url.parse::<Uri>(),
+        // `Host` moves into `:authority`. Google's servers reset any stream that has both, even
+        // when they match.
+        Upstream::H2(_) => match parts.headers.remove(HOST) {
+            Some(host) => match host.to_str() {
+                Ok(host) => format!("https://{host}{path}").parse::<Uri>(),
+                Err(e) => return Ok(flow.fail(e.to_string())),
+            },
+            None => url.parse::<Uri>(),
+        },
         Upstream::H1(_) => path.parse::<Uri>(),
     };
     parts.uri = match uri {
         Ok(uri) => uri,
         Err(e) => return Ok(flow.fail(e.to_string())),
     };
-    if !parts.headers.contains_key(HOST)
+    if matches!(upstream, Upstream::H1(_))
+        && !parts.headers.contains_key(HOST)
         && let Ok(host) = target.authority.parse()
     {
         parts.headers.insert(HOST, host);
